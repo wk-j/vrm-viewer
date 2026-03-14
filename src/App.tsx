@@ -7,7 +7,7 @@ import { ExpressionPanel } from "./components/ExpressionPanel";
 import "./App.css";
 
 // Default example files bundled in public/examples/
-const DEFAULT_VRM = "/examples/CoolAlien.vrm";
+const DEFAULT_VRM = "/examples/Skull.vrm";
 const DEFAULT_ANIMATION = "/examples/Hip Hop Dancing.fbx";
 
 type SideTab = "animation" | "expressions" | null;

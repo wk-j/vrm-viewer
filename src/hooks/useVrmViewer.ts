@@ -341,6 +341,8 @@ export function useVrmViewer(
         // The normalized bones are in a separate hierarchy from vrm.scene,
         // so the mixer must target that root to find bones by name.
         const mixerRoot = vrm.humanoid?.normalizedHumanBonesRoot ?? vrm.scene;
+        // The normalized rig is a detached hierarchy — update its world matrices
+        mixerRoot.updateMatrixWorld(true);
         mixerRef.current = new THREE.AnimationMixer(mixerRoot);
 
         // Detect expressions
@@ -653,16 +655,14 @@ export function useVrmViewer(
   };
 
   // --- FBX retargeting helper ---
-  // Mixamo FBX animations store per-bone rotations as absolute local quaternions.
-  // The FBX skeleton rest pose may differ from the VRM skeleton rest pose.
-  // Strategy:
-  //   For each bone, compute the "motion delta" relative to the FBX rest pose,
-  //   then apply that delta on top of the VRM rest pose.
-  //   motionDelta = inverse(fbxRest) * fbxAnim
-  //   vrmAnim = vrmRest * motionDelta
+  // Retargets Mixamo FBX animations to VRM normalized bones.
   //
-  // We also need to handle the case where bone names in FBX tracks may be
-  // prefixed (e.g. "Armature|mixamorigHips") by stripping to the last segment.
+  // VRM normalized bones have identity rest rotations by design.
+  // The motion delta from the Mixamo rest pose IS the final normalized rotation:
+  //   vrmNormalizedLocal = inverse(fbxLocalRest) * fbxLocalAnim
+  //
+  // This works because both Mixamo and VRM normalized skeletons use a
+  // standardized T-pose with consistent bone axes (Y-up, forward-facing).
   function retargetClipToVRM(
     clip: THREE.AnimationClip,
     fbxRoot: THREE.Group,
@@ -678,33 +678,35 @@ export function useVrmViewer(
       }
     });
 
-    // Capture FBX rest quaternions and VRM rest quaternions for each mapped bone
-    const fbxRestQuats = new Map<string, THREE.Quaternion>();
-    const vrmRestQuats = new Map<string, THREE.Quaternion>();
-    const vrmBoneNodes = new Map<string, THREE.Object3D>();
+    // For each mapped bone, capture the FBX rest quaternion and VRM normalized node
+    interface BoneMapping {
+      fbxRestInv: THREE.Quaternion;
+      vrmNode: THREE.Object3D;
+    }
+
+    const boneMappings = new Map<string, BoneMapping>();
 
     for (const [mixamoName, humanBone] of Object.entries(MIXAMO_TO_VRM_BONE)) {
       const fbxBone = fbxBoneMap.get(mixamoName);
-      // Use normalized bones — vrm.update() will propagate these to raw bones
-      const vrmBoneNode = vrm.humanoid.getNormalizedBoneNode(humanBone as any);
-      if (fbxBone && vrmBoneNode) {
-        fbxRestQuats.set(mixamoName, fbxBone.quaternion.clone());
-        // Normalized bones have identity rest pose (that's the whole point)
-        vrmRestQuats.set(mixamoName, new THREE.Quaternion());
-        vrmBoneNodes.set(mixamoName, vrmBoneNode);
-      }
+      const vrmNode = vrm.humanoid.getNormalizedBoneNode(humanBone as any);
+      if (!fbxBone || !vrmNode) continue;
+
+      boneMappings.set(mixamoName, {
+        fbxRestInv: fbxBone.quaternion.clone().invert(),
+        vrmNode,
+      });
     }
 
     // Compute scale factor for hips position tracks
     let hipsScaleFactor = 1;
     const fbxHips = fbxBoneMap.get("mixamorigHips");
-    const vrmHipsBone = vrm.humanoid.getNormalizedBoneNode("hips" as any);
-    if (fbxHips && vrmHipsBone) {
+    const rawHips = vrm.humanoid.getRawBoneNode("hips" as any);
+    if (fbxHips && rawHips) {
       const fbxHipsY = new THREE.Vector3().setFromMatrixPosition(
         fbxHips.matrixWorld
       ).y;
       const vrmHipsY = new THREE.Vector3().setFromMatrixPosition(
-        vrmHipsBone.matrixWorld
+        rawHips.matrixWorld
       ).y;
       if (fbxHipsY > 0.001) {
         hipsScaleFactor = vrmHipsY / fbxHipsY;
@@ -714,31 +716,26 @@ export function useVrmViewer(
     const retargetedTracks: THREE.KeyframeTrack[] = [];
 
     for (const track of clip.tracks) {
-      // track.name: "boneName.property" or "boneName.property[index]"
       const dotIdx = track.name.indexOf(".");
       if (dotIdx < 0) continue;
 
       let fbxBoneName = track.name.substring(0, dotIdx);
       const property = track.name.substring(dotIdx + 1);
 
-      // Strip armature prefix (e.g. "Armature|mixamorigHips" -> "mixamorigHips")
+      // Strip armature prefix (e.g. "Armature|mixamorigHips")
       const pipeIdx = fbxBoneName.lastIndexOf("|");
       if (pipeIdx >= 0) {
         fbxBoneName = fbxBoneName.substring(pipeIdx + 1);
       }
 
-      const vrmBoneNode = vrmBoneNodes.get(fbxBoneName);
-      if (!vrmBoneNode) continue;
+      const mapping = boneMappings.get(fbxBoneName);
+      if (!mapping) continue;
 
       if (property === "quaternion") {
-        const fbxRest = fbxRestQuats.get(fbxBoneName);
-        const vrmRest = vrmRestQuats.get(fbxBoneName);
-        if (!fbxRest || !vrmRest) continue;
+        const { fbxRestInv, vrmNode } = mapping;
 
-        const fbxRestInv = fbxRest.clone().invert();
         const values = new Float32Array(track.values.length);
         const animQ = new THREE.Quaternion();
-        const deltaQ = new THREE.Quaternion();
 
         for (let i = 0; i < track.values.length; i += 4) {
           animQ.set(
@@ -748,10 +745,9 @@ export function useVrmViewer(
             track.values[i + 3]
           );
 
-          // motionDelta = fbxRestInv * animQ
-          // result = vrmRest * motionDelta
-          deltaQ.copy(fbxRestInv).multiply(animQ);
-          animQ.copy(vrmRest).multiply(deltaQ);
+          // Motion delta = inverse(fbxRest) * fbxAnim
+          // Since VRM normalized rest is identity, this IS the final rotation
+          animQ.premultiply(fbxRestInv);
 
           values[i] = animQ.x;
           values[i + 1] = animQ.y;
@@ -761,13 +757,13 @@ export function useVrmViewer(
 
         retargetedTracks.push(
           new THREE.QuaternionKeyframeTrack(
-            vrmBoneNode.name + ".quaternion",
+            vrmNode.name + ".quaternion",
             Array.from(track.times),
             Array.from(values)
           )
         );
       } else if (property === "position") {
-        // Position tracks: keep for hips (root motion), scale appropriately
+        // Position tracks: keep for hips only, scale to match VRM size
         const vrmHumanBoneName = MIXAMO_TO_VRM_BONE[fbxBoneName];
         if (vrmHumanBoneName === "hips") {
           const values = new Float32Array(track.values.length);
@@ -779,7 +775,7 @@ export function useVrmViewer(
 
           retargetedTracks.push(
             new THREE.VectorKeyframeTrack(
-              vrmBoneNode.name + ".position",
+              mapping.vrmNode.name + ".position",
               Array.from(track.times),
               Array.from(values)
             )
